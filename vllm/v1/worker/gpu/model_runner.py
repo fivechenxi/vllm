@@ -1513,7 +1513,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                decode_query_len=self.decode_query_len,
             )
+            if self.use_dcp:
+                # DP synchronization can ask an otherwise-idle DCP rank to
+                # execute a dummy decode batch. Dummy InputBatch construction
+                # populates global seq_lens but has no request state from which
+                # prepare_inputs() could derive the rank-local DCP lengths.
+                # Build them here exactly as for a real batch; MLA decode
+                # metadata requires both global and local sequence lengths.
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    input_batch.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                    : input_batch.num_reqs_after_padding
+                ]
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
