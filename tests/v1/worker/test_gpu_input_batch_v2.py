@@ -54,6 +54,34 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     )
 
 
+@pytest.mark.parametrize(
+    "num_reqs,num_tokens,expected_prefills",
+    [
+        (3, 12, [False, False, False]),
+        (3, 14, [False, True, True]),
+        (1, 4096, [True]),
+    ],
+)
+def test_make_dummy_classifies_synced_prefill_shapes(
+    num_reqs: int, num_tokens: int, expected_prefills: list[bool]
+):
+    """DP dummy batches retain prefill semantics after shape sync."""
+    buffers = InputBuffers(
+        max_num_reqs=num_reqs,
+        max_num_tokens=num_tokens,
+        device=torch.device(DEVICE),
+    )
+    batch = InputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        buffers,
+        decode_query_len=4,
+    )
+
+    assert batch.is_prefilling_np.tolist() == expected_prefills
+    assert batch.has_prefill == any(expected_prefills)
+
+
 def test_maybe_prepare_dcp_local_seq_lens(monkeypatch: pytest.MonkeyPatch):
     buffers = InputBuffers(max_num_reqs=4, max_num_tokens=4, device=torch.device("cpu"))
     batch = InputBatch.make_dummy(2, 4, buffers)

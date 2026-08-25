@@ -1560,6 +1560,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                decode_query_len=self.decode_query_len,
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
