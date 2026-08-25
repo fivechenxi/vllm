@@ -2251,6 +2251,36 @@ def _grouping_config():
     )
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [("kimi_k3", True), ("qwen3", False)],
+)
+def test_dspark_veto_exemption_is_scoped_to_kimi_k3(model_type, expected):
+    speculative_config = SimpleNamespace(
+        use_eagle=lambda: True,
+        use_dspark=lambda: True,
+        has_ephemeral_draft_context=lambda: True,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+    )
+    specs = {
+        "target": new_mla_spec(),
+        "draft": new_mla_spec(),
+    }
+    groups = [
+        KVCacheGroupSpec(["target"], specs["target"]),
+        KVCacheGroupSpec(["draft"], specs["draft"]),
+    ]
+
+    kv_cache_utils._annotate_draft_cache_group(vllm_config, specs, groups)
+
+    assert groups[0].is_eagle_group is False
+    assert groups[1].is_eagle_group is expected
+    assert groups[1].eagle_group_is_veto_exempt is expected
+
+
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     block_size = 544
     full_spec = FullAttentionSpec(

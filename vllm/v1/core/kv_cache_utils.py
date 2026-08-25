@@ -1717,7 +1717,7 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
-def _annotate_eagle_groups_deepseek_v4(
+def _annotate_draft_cache_group(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1725,15 +1725,19 @@ def _annotate_eagle_groups_deepseek_v4(
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
         return
-    # Detection uses the merged MLA spec's model_version.
-    if not any(
+    # DeepSeek-V4 uses the merged MLA spec marker. Kimi-K3 reaches the
+    # general multi-group path because it also has KDA/Mamba groups, but its
+    # DSpark draft layers follow the same append-after-target ordering.
+    is_deepseek_v4 = any(
         getattr(spec, "model_version", None) == "deepseek_v4"
         for spec in kv_cache_spec.values()
-    ):
+    )
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    is_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
+    if not is_deepseek_v4 and not (is_kimi_k3 and spec_config.use_dspark()):
         return
-    # DeepseekV4's MTP attention layer is always the last layer, and we flag whichever
-    # group contains it.
-    # FIXME(yifan): avoid/generalize this hacky check.
+    # Both supported layouts append the draft attention layer after the
+    # target model's cache layers.
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:
         if last_layer in group.layer_names:
@@ -1786,7 +1790,7 @@ def get_kv_cache_groups(
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
+        _annotate_draft_cache_group(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
@@ -1831,6 +1835,9 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    # Kimi-K3 + DSpark reaches this general hybrid grouping path (KDA/Mamba
+    # plus target MLA plus draft MLA), unlike DeepSeek-V4's uniform-group path.
+    _annotate_draft_cache_group(vllm_config, kv_cache_spec, groups)
     return groups
 
 

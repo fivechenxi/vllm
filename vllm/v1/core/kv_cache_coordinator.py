@@ -890,7 +890,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else 1
                     ),
                 )
-                if veto_exempt and _new_hit_length == 0:
+                if veto_exempt and _new_hit_length < curr_hit_length:
                     # Not authoritative: leave unconfirmed for this round
                     # rather than vetoing every other group's confirmed hit.
                     continue

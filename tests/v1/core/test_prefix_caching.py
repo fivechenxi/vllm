@@ -4336,11 +4336,13 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
 
 
-def test_eagle_group_veto_exempt_does_not_poison_other_groups():
+@pytest.mark.parametrize("draft_blocks_kept", [0, 2])
+def test_eagle_group_veto_exempt_does_not_poison_other_groups(
+    draft_blocks_kept,
+):
     """A veto-exempt eagle group (KVCacheGroupSpec.eagle_group_is_veto_exempt,
-    e.g. DSpark's draft-context group per
-    SpeculativeConfig.has_ephemeral_draft_context()) whose lookup finds zero
-    matching blocks must not zero out another group's independently
+    e.g. DSpark's ephemeral draft-context group) whose lookup finds no or a
+    shorter match must not reduce another group's independently
     confirmed hit. Regular eagle groups (EAGLE/EAGLE3/MTP/DFlash without the
     veto-exempt flag) already zero the whole request on a miss, unchanged,
     and are covered by test_prefill_hybrid_model_eagle and friends."""
@@ -4397,7 +4399,7 @@ def test_eagle_group_veto_exempt_does_not_poison_other_groups():
     req1 = make_request("1", token_ids, block_size, hash_fn)
     group1_hashes = [make_block_hash_with_group_id(h, 1) for h in block_hashes]
     cache = manager.block_pool.cached_block_hash_to_block._cache
-    backup = {h: cache.pop(h) for h in group1_hashes if h in cache}
+    backup = {h: cache.pop(h) for h in group1_hashes[draft_blocks_kept:] if h in cache}
     try:
         computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     finally:
