@@ -577,6 +577,12 @@ def copy_kv_cache_blocks_inplace(
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices = async_tensor_h2d(indices_np, device=device)
     src_indices, dst_indices = indices.unbind(dim=1)
+    src_block_ids = set(indices_np[:, 0].tolist())
+    dst_block_ids = set(indices_np[:, 1].tolist())
+    # CoW destinations are newly allocated blocks. Keep the simultaneous-copy
+    # fallback for unexpected overlapping mappings, but bound the temporary
+    # gather for the normal disjoint case.
+    copies_are_disjoint = src_block_ids.isdisjoint(dst_block_ids)
 
     for tensor in storage_tensors:
         assert tensor.device == device
@@ -586,7 +592,18 @@ def copy_kv_cache_blocks_inplace(
         # [i * page_size, (i + 1) * page_size).
         assert blocks.numel() % num_blocks == 0
         blocks = blocks.view(num_blocks, -1)
-        blocks[dst_indices] = blocks[src_indices]
+        if not copies_are_disjoint:
+            blocks[dst_indices] = blocks[src_indices]
+            continue
+
+        # Advanced indexing materializes the entire RHS. Hybrid K3 pages are
+        # large enough that a many-request prefix fan-out can otherwise need
+        # multiple GiB of transient GPU memory.
+        max_temporary_bytes = 128 * 1024 * 1024
+        copies_per_chunk = max(1, max_temporary_bytes // blocks.shape[1])
+        for start in range(0, len(kv_cache_block_copies), copies_per_chunk):
+            end = start + copies_per_chunk
+            blocks[dst_indices[start:end]] = blocks[src_indices[start:end]]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
