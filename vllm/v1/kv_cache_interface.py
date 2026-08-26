@@ -958,6 +958,11 @@ class KVCacheGroupSpec:
     # value (DSpark today), as opposed to methods like EAGLE/EAGLE3/MTP
     # whose draft KV is genuinely, incrementally reusable.
     eagle_group_is_veto_exempt: bool = False
+    # Whether this physical group contains an ephemeral draft-attention layer
+    # alongside reusable target-model layers. Such a mixed group must retain
+    # ordinary target cache lookup/publication semantics; the draft's restored
+    # prefix validity is tracked separately by the speculator.
+    contains_ephemeral_draft_layer: bool = False
 
 
 @dataclass

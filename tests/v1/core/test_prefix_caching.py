@@ -4481,3 +4481,48 @@ def test_non_veto_exempt_eagle_group_miss_still_zeros_whole_request():
     assert len(computed_blocks.blocks[0]) == 0
     assert len(computed_blocks.blocks[1]) == 0
     manager.free(req1)
+
+
+def test_mixed_ephemeral_group_suppresses_legacy_eagle_fallback():
+    """A packed target+DSpark group must retain ordinary target cache hits."""
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target_mla", "dspark_draft_mla"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                contains_ephemeral_draft_layer=True,
+            )
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+    assert manager.coordinator.eagle_group_ids == set()
+
+    token_ids = [i for i in range(4) for _ in range(block_size)]
+    req0 = make_request("mixed-0", token_ids, block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    manager.allocate_slots(req0, len(token_ids), num_computed, computed)
+    manager.free(req0)
+
+    req1 = make_request("mixed-1", token_ids, block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(req1)
+    # The ordinary full-attention path reserves the final block, so this is a
+    # three-block hit. The regression is that it must not become zero through
+    # the legacy all-groups EAGLE fallback.
+    assert num_computed == len(token_ids) - block_size
+    assert len(computed.blocks[0]) == len(token_ids) // block_size - 1
+    manager.free(req1)

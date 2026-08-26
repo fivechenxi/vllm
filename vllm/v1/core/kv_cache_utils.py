@@ -1786,8 +1786,16 @@ def _annotate_eagle_groups_deepseek_v4(
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:
         if last_layer in group.layer_names:
-            group.is_eagle_group = True
-            group.eagle_group_is_veto_exempt = spec_config.has_ephemeral_draft_context()
+            ephemeral = spec_config.has_ephemeral_draft_context()
+            if ephemeral and len(group.layer_names) > 1:
+                # The group physically contains reusable target MLA and an
+                # ephemeral DSpark/DFlash layer. Cache it authoritatively as a
+                # target group; request-local draft prefix validity is handled
+                # by the speculator's restored-token mask.
+                group.contains_ephemeral_draft_layer = True
+            else:
+                group.is_eagle_group = True
+                group.eagle_group_is_veto_exempt = ephemeral
             break
 
 
@@ -2137,6 +2145,10 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                contains_ephemeral_draft_layer=(
+                    group.contains_ephemeral_draft_layer
+                    and bool(worker_layer_names)
+                ),
                 eagle_group_is_veto_exempt=group.eagle_group_is_veto_exempt
                 and bool(worker_layer_names),
             )

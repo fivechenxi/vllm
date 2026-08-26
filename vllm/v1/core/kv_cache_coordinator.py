@@ -118,8 +118,17 @@ class KVCacheCoordinator(ABC):
             for i, g in enumerate(kv_cache_config.kv_cache_groups)
             if g.is_eagle_group and g.eagle_group_is_veto_exempt
         }
-        # Conservatively fall back to flag all groups when no group is flagged.
-        if use_eagle and not self.eagle_group_ids:
+        # A mixed target+ephemeral-draft physical group deliberately uses
+        # normal target cache semantics. Its explicit marker suppresses the
+        # legacy all-groups EAGLE fallback; the speculator masks restored
+        # tokens out of the ephemeral draft context independently.
+        has_mixed_ephemeral_group = any(
+            g.contains_ephemeral_draft_layer
+            for g in kv_cache_config.kv_cache_groups
+        )
+        # Conservatively fall back to flag all groups only when no group-level
+        # EAGLE metadata is available.
+        if use_eagle and not self.eagle_group_ids and not has_mixed_ephemeral_group:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
