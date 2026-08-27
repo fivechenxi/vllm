@@ -1771,11 +1771,14 @@ def _annotate_eagle_groups_deepseek_v4(
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
         return
-    # Detection uses the merged MLA spec's model_version.
-    if not any(
+    # DeepSeek-V4 uses the merged MLA spec marker. Kimi-K3 reaches the
+    # general multi-group path because it also has KDA/Mamba groups, but its
+    # DSpark draft layers follow the same append-after-target ordering.
+    is_deepseek_v4 = any(
         getattr(spec, "model_version", None) == "deepseek_v4"
         for spec in kv_cache_spec.values()
-    ):
+    )
+    if not is_deepseek_v4 and not spec_config.use_dspark():
         return
     # DeepseekV4's MTP attention layer is always the last layer, and we flag whichever
     # group contains it.
@@ -1783,7 +1786,16 @@ def _annotate_eagle_groups_deepseek_v4(
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:
         if last_layer in group.layer_names:
-            group.is_eagle_group = True
+            ephemeral = spec_config.has_ephemeral_draft_context()
+            if ephemeral and len(group.layer_names) > 1:
+                # The group physically contains reusable target MLA and an
+                # ephemeral DSpark/DFlash layer. Cache it authoritatively as a
+                # target group; request-local draft prefix validity is handled
+                # by the speculator's restored-token mask.
+                group.contains_ephemeral_draft_layer = True
+            else:
+                group.is_eagle_group = True
+                group.eagle_group_is_veto_exempt = ephemeral
             break
 
 
@@ -1876,6 +1888,9 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    # Kimi-K3 + DSpark reaches this general hybrid grouping path (KDA/Mamba
+    # plus target MLA plus draft MLA), unlike DeepSeek-V4's uniform-group path.
+    _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
     return groups
 
 
@@ -2130,6 +2145,12 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                contains_ephemeral_draft_layer=(
+                    group.contains_ephemeral_draft_layer
+                    and bool(worker_layer_names)
+                ),
+                eagle_group_is_veto_exempt=group.eagle_group_is_veto_exempt
+                and bool(worker_layer_names),
             )
         )
     return projected_groups

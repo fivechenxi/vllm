@@ -2084,7 +2084,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
+            16 * 1024,
         )
 
         return align_mla_chunked_context_workspace_size(

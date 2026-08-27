@@ -51,3 +51,35 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+@pytest.mark.parametrize(
+    "num_reqs,num_tokens,expected_prefills",
+    [
+        (3, 12, [False, False, False]),
+        (3, 14, [False, True, True]),
+        (1, 4096, [True]),
+    ],
+)
+def test_make_dummy_classifies_synced_prefill_shapes(
+    num_reqs: int, num_tokens: int, expected_prefills: list[bool]
+):
+    """DP dummy batches must retain prefill semantics after shape sync.
+
+    With speculative decode query length 4, a dummy rank synchronized to a
+    prefill-heavy peer can receive longer queries. Treating those as decodes
+    violates hybrid recurrent-state activation limits (for example K3
+    RecoverSSM) even though the batch contains no real local requests.
+    """
+    buffers = InputBuffers(
+        max_num_reqs=num_reqs, max_num_tokens=num_tokens, device=torch.device(DEVICE)
+    )
+    batch = InputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        buffers,
+        decode_query_len=4,
+    )
+
+    assert batch.is_prefilling_np.tolist() == expected_prefills
+    assert batch.has_prefill == any(expected_prefills)

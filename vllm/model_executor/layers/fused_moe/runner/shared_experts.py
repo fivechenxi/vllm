@@ -162,6 +162,10 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def discard_output(self) -> None:
+        """Roll back a staged output when routed-expert execution fails."""
+        self._output[self._output_idx] = None
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,

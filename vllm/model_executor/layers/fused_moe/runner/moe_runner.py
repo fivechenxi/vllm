@@ -584,29 +584,39 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self.routed_experts.quant_method.is_monolithic:
-            # Monolithic kernels: pass router_logits to routed_experts
-            fused_out = self.routed_experts.forward_monolithic(
-                x=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
-        else:
-            # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+        try:
+            if self.routed_experts.quant_method.is_monolithic:
+                # Monolithic kernels: pass router_logits to routed_experts
+                fused_out = self.routed_experts.forward_monolithic(
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+            else:
+                # Modular kernels: select experts first, then call routed_experts
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+        except Exception:
+            # Shared experts stage their output before routed experts run. If
+            # routing or the routed MoE kernel fails (for example, a transient
+            # workspace OOM), normal consumption through `.output` is skipped.
+            # Roll the staged state back so a later invocation reports the
+            # original failure rather than a misleading stale-output assertion.
+            if self._shared_experts is not None:
+                self._shared_experts.discard_output()
+            raise
 
         self._maybe_apply_shared_experts(
             shared_experts_input,

@@ -2161,6 +2161,31 @@ def test_generate_scheduler_kv_cache_config():
     )
 
 
+def test_dspark_mixed_group_keeps_target_cache_semantics():
+    """A packed target+DSpark group stays physical, but is not an EAGLE group."""
+    target_layer = "model.layers.0.self_attn.attn"
+    draft_layer = "model.draft_model.layers.0.self_attn.attn"
+    spec = new_kv_cache_spec()
+    groups = [KVCacheGroupSpec([target_layer, draft_layer], spec)]
+    spec_config = SimpleNamespace(
+        use_eagle=lambda: True,
+        use_dspark=lambda: True,
+        has_ephemeral_draft_context=lambda: True,
+    )
+    config = SimpleNamespace(speculative_config=spec_config)
+
+    kv_cache_utils._annotate_eagle_groups_deepseek_v4(
+        config,
+        {target_layer: spec, draft_layer: spec},
+        groups,
+    )
+
+    assert groups[0].layer_names == [target_layer, draft_layer]
+    assert groups[0].contains_ephemeral_draft_layer
+    assert not groups[0].is_eagle_group
+    assert not groups[0].eagle_group_is_veto_exempt
+
+
 def test_mixed_precision_kv_cache_with_uniform_type_specs():
     fp8_spec = new_kv_cache_spec(dtype=torch.float8_e4m3fn)
     bf16_spec = new_kv_cache_spec(dtype=torch.bfloat16)
