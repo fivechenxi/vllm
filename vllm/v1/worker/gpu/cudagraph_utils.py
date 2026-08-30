@@ -521,6 +521,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
+                decode_query_len=self.decode_query_len,
             )
 
             # Capture with dummy rows marked as padding.
@@ -613,9 +614,14 @@ def prepare_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
     max_query_len: int | None = None,
+    decode_query_len: int | None = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
-        num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
+        num_reqs,
+        num_tokens,
+        input_buffers,
+        max_query_len=max_query_len,
+        decode_query_len=decode_query_len,
     )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)

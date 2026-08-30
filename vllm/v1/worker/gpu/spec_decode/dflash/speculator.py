@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -74,6 +75,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
+        )
+
+        # Per-request-slot count of tokens whose KV was restored (e.g. from the
+        # prefix cache) at the request's last (re)admission, indexed by
+        # req_state_idx. The target never ran a forward pass over them, so
+        # their draft context KV was never computed; the prep kernel and the
+        # block-table shift in propose() hide them from the draft's attention.
+        # The runner replaces this zeros fallback via set_num_cached_tokens.
+        self.num_cached_tokens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
         )
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
@@ -161,6 +172,13 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> nn.Module:
         return load_dflash_model(target_model, self.vllm_config)
 
+    def set_num_cached_tokens(self, num_cached_tokens: torch.Tensor) -> None:
+        """Register the runner's per-request-slot cache-restored token counts.
+
+        Indexed by req_state_idx; see the buffer comment in __init__.
+        """
+        self.num_cached_tokens = num_cached_tokens
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -182,6 +200,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        # The shared seq_lens buffer carries the cache-shifted draft sequence
+        # lengths (see _prepare_dflash_inputs_kernel), which only works if all
+        # draft groups shift by the same number of global token slots per
+        # block-table entry. DCP shards one global block across cp_size ranks.
+        draft_effective_block_sizes = {
+            self.block_tables.kernel_block_sizes[gid] * self.block_tables.cp_size
+            for gid in self.draft_kv_cache_group_ids
+        }
+        assert len(draft_effective_block_sizes) == 1, (
+            "DFlash requires a uniform block size across draft KV cache "
+            f"groups, got {draft_effective_block_sizes}."
+        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -285,10 +315,21 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_per_req: int | None = None,
         causal: bool | Mapping[int, bool] = False,
         query_start_loc_np: np.ndarray | None = None,
+        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
+        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.block_tables.cp_size,
+                self.block_tables.cp_rank,
+                self.block_tables.cp_interleave,
+            )
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
         return super()._build_draft_attn_metadata(
             num_reqs,
             num_reqs_padded,
@@ -298,6 +339,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_query_per_req=self.num_query_per_req,
             causal=causal,
             query_start_loc_np=query_start_loc_np,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
     @torch.inference_mode()
@@ -393,6 +435,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.block_tables.cp_size,
+                self.block_tables.cp_interleave,
+                self.num_cached_tokens,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -401,6 +447,28 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        # Cache-restored tokens (e.g. prefix-cache hits) never flowed through
+        # the target forward, so their draft context KV was never written and
+        # their cache slots hold garbage. Hide them from the draft's
+        # attention: shift each draft block-table row left by the restored
+        # whole blocks (the prep kernel shortened seq_lens to match). Runs
+        # after prepare_dflash_inputs because the slot mappings index the
+        # unshifted table; in-place is safe because input_block_tables are
+        # regathered from the persistent block tables every step. Up to
+        # block_size - 1 restored slots may remain visible when the restored
+        # count is not block-aligned (e.g. a full-prompt cache hit). Skipped
+        # for dummy runs, whose idx_mapping does not reference live requests.
+        if not dummy_run:
+            for gid in self.draft_kv_cache_group_ids:
+                shift_draft_block_tables(
+                    self.block_tables.input_block_tables[gid],
+                    input_batch.idx_mapping,
+                    self.num_cached_tokens,
+                    self.input_buffers.seq_lens,
+                    self.block_tables.kernel_block_sizes[gid]
+                    * self.block_tables.cp_size,
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -499,6 +567,8 @@ def _prepare_dflash_inputs_kernel(
     # Block table for slot mapping lookup.
     block_table_ptr,
     block_table_stride,
+    # [max_num_reqs] cache-restored token counts, indexed by req_state_idx.
+    num_cached_tokens_ptr,
     # Scalars
     parallel_drafting_token_id,
     block_size,
@@ -507,8 +577,11 @@ def _prepare_dflash_inputs_kernel(
     max_num_reqs,
     max_num_tokens,
     max_model_len,
+    cp_rank,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
+    CP_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -543,7 +616,7 @@ def _prepare_dflash_inputs_kernel(
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
-    ctx_block_num = ctx_pos // block_size
+    ctx_block_num = ctx_pos // (block_size * CP_SIZE)
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
@@ -554,9 +627,12 @@ def _prepare_dflash_inputs_kernel(
     # to it after eviction; rejected suffix rows are invalid context as well.
     # Neither kind of row may write draft KV into physical block 0.
     ctx_resident = is_valid_ctx & (ctx_block_id != 0)
+    local_ctx_slot = cp_local_slot(
+        ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
+    )
     ctx_slot = tl.where(
         ctx_resident,
-        ctx_block_id * block_size + (ctx_pos % block_size),
+        local_ctx_slot,
         PAD_SLOT_ID,
     )
     # Stored over the full [0, num_ctx) span while the loads above are masked to
@@ -573,7 +649,7 @@ def _prepare_dflash_inputs_kernel(
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
 
-    q_block_num = query_pos // block_size
+    q_block_num = query_pos // (block_size * CP_SIZE)
     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
     q_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + q_block_num,
@@ -583,9 +659,18 @@ def _prepare_dflash_inputs_kernel(
     # A null block is never a writable cache slot. This can occur when a
     # sliding-window block table contains evicted/global padding entries.
     q_resident = is_query & (q_block_id != 0)
+    local_q_slot = cp_local_slot(
+        query_pos,
+        q_block_id,
+        block_size,
+        cp_rank,
+        CP_SIZE,
+        CP_INTERLEAVE,
+        PAD_SLOT_ID,
+    )
     q_slot = tl.where(
         q_resident,
-        q_block_id * block_size + (query_pos % block_size),
+        local_q_slot,
         PAD_SLOT_ID,
     )
 
@@ -611,10 +696,20 @@ def _prepare_dflash_inputs_kernel(
         tl.store(out_query_start_loc_ptr + req_idx, query_base)
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
-        # tokens this step.
+        # tokens this step — minus the cache-restored whole global blocks,
+        # which hold no reusable draft KV and are shifted out of the draft
+        # block-table view. DCP shards each global block across CP_SIZE ranks.
+        num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
+        effective_block_size = block_size * CP_SIZE
+        num_shifted_slots = (
+            num_cached // effective_block_size
+        ) * effective_block_size
+        absolute_seq_len = tl.minimum(
+            last_valid_pos + 1 + num_query_per_req, max_model_len
+        )
         tl.store(
             out_seq_lens_ptr + req_idx,
-            tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len),
+            tl.maximum(absolute_seq_len - num_shifted_slots, num_query_per_req),
         )
         # Copy sampling state.
         tl.store(
@@ -681,6 +776,11 @@ def prepare_dflash_inputs(
     # [max_num_reqs, max_num_blocks]
     block_table: torch.Tensor,
     block_size: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
+    # [max_num_reqs]
+    num_cached_tokens: torch.Tensor,
     parallel_drafting_token_id: int,
     num_query_per_req: int,
     num_speculative_steps: int,
@@ -721,6 +821,7 @@ def prepare_dflash_inputs(
         input_seeds,
         block_table,
         block_table.stride(0),
+        num_cached_tokens,
         parallel_drafting_token_id,
         block_size,
         num_query_per_req,
@@ -728,7 +829,70 @@ def prepare_dflash_inputs(
         max_num_reqs,
         max_num_tokens,
         max_model_len,
+        cp_rank,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
+        CP_SIZE=cp_size,
+        CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+@triton.jit
+def _shift_draft_block_tables_kernel(
+    block_table_ptr,
+    block_table_stride,
+    idx_mapping_ptr,
+    num_cached_tokens_ptr,
+    seq_lens_ptr,
+    block_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
+    shift = num_cached // block_size
+    if shift == 0:
+        return
+    row_ptr = block_table_ptr + req_idx.to(tl.int64) * block_table_stride
+    # Only the blocks the shifted sequence still references need to move;
+    # seq_lens holds the cache-shifted draft length (written by
+    # _prepare_dflash_inputs_kernel, which must run first).
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    num_needed = (seq_len + block_size - 1) // block_size
+    num_remaining = tl.minimum(block_table_stride - shift, num_needed)
+    # In-place left shift is safe: iterations run in ascending order and each
+    # loads its chunk (from offset + shift) before storing (at offset), so no
+    # store ever precedes a load of the same element.
+    for i in tl.range(0, num_remaining, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        mask = offset < num_remaining
+        block_ids = tl.load(row_ptr + offset + shift, mask=mask, other=0)
+        tl.store(row_ptr + offset, block_ids, mask=mask)
+
+
+def shift_draft_block_tables(
+    # [max_num_reqs, max_num_blocks]
+    block_table: torch.Tensor,
+    # [num_reqs]
+    idx_mapping: torch.Tensor,
+    # [max_num_reqs]
+    num_cached_tokens: torch.Tensor,
+    # [num_reqs] cache-shifted draft sequence lengths
+    seq_lens: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Shift each request's draft block-table row left by its cache-restored
+    whole blocks, hiding slots that hold no draft context KV from the draft's
+    attention. Must run after prepare_dflash_inputs (slot mappings index the
+    unshifted table, and seq_lens must already hold the shifted lengths)."""
+    num_reqs = idx_mapping.shape[0]
+    _shift_draft_block_tables_kernel[(num_reqs,)](
+        block_table,
+        block_table.stride(0),
+        idx_mapping,
+        num_cached_tokens,
+        seq_lens,
+        block_size,
+        BLOCK_SIZE=1024,  # type: ignore
     )

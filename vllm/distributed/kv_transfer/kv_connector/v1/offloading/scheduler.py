@@ -227,7 +227,11 @@ class SchedulerOffloadConfig(NamedTuple):
             vllm_config.speculative_config is not None
             and vllm_config.speculative_config.use_eagle()
         )
-        if use_eagle and not eagle_groups:
+        has_mixed_ephemeral_group = any(
+            g.contains_ephemeral_draft_layer
+            for g in kv_cache_config.kv_cache_groups
+        )
+        if use_eagle and not eagle_groups and not has_mixed_ephemeral_group:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
         if eagle_groups:

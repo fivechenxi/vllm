@@ -119,6 +119,7 @@ class InputBatch:
         num_tokens: int,
         input_buffers: InputBuffers,
         max_query_len: int | None = None,
+        decode_query_len: int | None = None,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
@@ -140,6 +141,17 @@ class InputBatch:
         if num_extra > 0:
             num_scheduled_tokens[-num_extra:] += 1
         assert int(num_scheduled_tokens.sum()) == num_tokens
+
+        # A DP rank with no local work executes a dummy batch whose shape is
+        # synchronized to the busiest rank. If that rank is prefilling, the
+        # synchronized dummy queries can be longer than a decode step. Preserve
+        # that distinction so hybrid/speculative attention backends do not
+        # mistake a long dummy prefill for speculative decode.
+        is_prefilling_np = (
+            num_scheduled_tokens > decode_query_len
+            if decode_query_len is not None
+            else np.zeros(num_reqs, dtype=np.bool_)
+        )
 
         # seq_len equals to query_len
         input_buffers.seq_lens[: num_reqs - num_extra] = base_tokens
@@ -192,8 +204,8 @@ class InputBatch:
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-            is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
-            has_prefill=False,
+            is_prefilling_np=is_prefilling_np,
+            has_prefill=bool(is_prefilling_np.any()),
             max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,

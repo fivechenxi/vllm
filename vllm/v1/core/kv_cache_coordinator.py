@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -45,16 +44,18 @@ def _validate_prefix_cache_retention_interval(
         isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
         for g in kv_cache_config.kv_cache_groups
     ):
+        if retention_interval == 0:
+            return
         raise ValueError(
-            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
+            "prefix_cache_retention_interval is set but this model has "
             "no sliding-window or Mamba KV cache group, so retention has no "
-            "effect. Unset it (it only applies to sliding-window and Mamba "
+            "effect. Set it to 0 (it only applies to sliding-window and Mamba "
             "attention)."
         )
 
     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
         raise ValueError(
-            f"VLLM_PREFIX_CACHE_RETENTION_INTERVAL ({retention_interval}) "
+            f"prefix_cache_retention_interval ({retention_interval}) "
             "must be non-negative and a multiple of scheduler_block_size "
             f"({scheduler_block_size})."
         )
@@ -106,8 +107,28 @@ class KVCacheCoordinator(ABC):
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
-        # Conservatively fall back to flag all groups when no group is flagged.
-        if use_eagle and not self.eagle_group_ids:
+        # Subset of eagle_group_ids whose miss must not veto the cache-hit
+        # convergence of other groups (see KVCacheGroupSpec.
+        # eagle_group_is_veto_exempt). Left empty in the "flag all groups"
+        # fallback below: per-group veto-exemption is unknown in that case,
+        # so we conservatively preserve the original all-groups-authoritative
+        # behavior.
+        self.veto_exempt_eagle_group_ids: set[int] = {
+            i
+            for i, g in enumerate(kv_cache_config.kv_cache_groups)
+            if g.is_eagle_group and g.eagle_group_is_veto_exempt
+        }
+        # A mixed target+ephemeral-draft physical group deliberately uses
+        # normal target cache semantics. Its explicit marker suppresses the
+        # legacy all-groups EAGLE fallback; the speculator masks restored
+        # tokens out of the ephemeral draft context independently.
+        has_mixed_ephemeral_group = any(
+            g.contains_ephemeral_draft_layer
+            for g in kv_cache_config.kv_cache_groups
+        )
+        # Conservatively fall back to flag all groups only when no group-level
+        # EAGLE metadata is available.
+        if use_eagle and not self.eagle_group_ids and not has_mixed_ephemeral_group:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
@@ -151,7 +172,7 @@ class KVCacheCoordinator(ABC):
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
-        self.retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        self.retention_interval = kv_cache_config.prefix_cache_retention_interval
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
@@ -548,12 +569,20 @@ class SpecGroup(NamedTuple):
     ``use_eagle`` is True iff any member group is an EAGLE/MTP group. Members
     sharing a spec are cached and looked up jointly, so the EAGLE last-block drop
     is necessarily decided for the whole spec group.
+
+    ``veto_exempt`` is True only if EVERY member group is individually
+    veto-exempt (see KVCacheGroupSpec.eagle_group_is_veto_exempt), a
+    conservative AND, since exempting a merged group's miss also exempts it
+    for any non-exempt member sharing the same spec (in practice, members
+    that merge share an identical spec and thus an identical method-level
+    veto-exemption, so this is not expected to matter).
     """
 
     spec: KVCacheSpec
     group_ids: list[int]
     manager_cls: type[SingleTypeKVCacheManager]
     use_eagle: bool
+    veto_exempt: bool = False
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
@@ -618,15 +647,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention and Mamba groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
-        # Fine-grained hash hits require Mamba "align", no context
-        # parallelism, and compatible cache managers in every group.
+        # Fine-grained hash hits require Mamba "align" and compatible cache
+        # managers in every group. TP needs hashing finer than the Mamba block;
+        # DCP accepts equality because it scales the effective full-attention
+        # block instead.
         has_partial_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
+            and (
+                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
+                or (
+                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
+                )
+            )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = dcp_world_size == 1 and has_partial_mamba_group
+        self.enable_partial_hash_hits = has_partial_mamba_group
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -663,6 +699,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
+            veto_exempt = i in self.veto_exempt_eagle_group_ids
 
             # Try to find an existing group with the same spec
             for idx, group in enumerate(self.attention_groups):
@@ -671,12 +708,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         "Expected same manager class for identical KV cache specs."
                     )
                     group.group_ids.append(i)
-                    if use_eagle and not group.use_eagle:
-                        self.attention_groups[idx] = group._replace(use_eagle=True)
+                    new_use_eagle = group.use_eagle or use_eagle
+                    # AND-merge: a merged group is only veto-exempt if every
+                    # member is (conservative, see SpecGroup docstring).
+                    new_veto_exempt = group.veto_exempt and veto_exempt
+                    if (
+                        new_use_eagle != group.use_eagle
+                        or new_veto_exempt != group.veto_exempt
+                    ):
+                        self.attention_groups[idx] = group._replace(
+                            use_eagle=new_use_eagle, veto_exempt=new_veto_exempt
+                        )
                     break
             else:
                 self.attention_groups.append(
-                    SpecGroup(spec, [i], manager_cls, use_eagle)
+                    SpecGroup(spec, [i], manager_cls, use_eagle, veto_exempt)
                 )
 
         assert len(self.attention_groups) > 1, (
@@ -759,6 +805,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         types. This converges because length monotonically decreases and is
         bounded below by 0.
 
+        A veto-exempt eagle group (SpecGroup.veto_exempt, see
+        KVCacheGroupSpec.eagle_group_is_veto_exempt) whose lookup finds
+        exactly zero matching blocks for the current candidate length is
+        left unconfirmed for this round instead of shrinking
+        ``curr_hit_length`` to 0: such a group's stored content has no
+        request-independent reuse value, so a miss from it does not mean
+        the other, independently-confirmed groups' data is unavailable.
+
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
@@ -791,9 +845,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
 
-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
-                self.attention_groups
-            ):
+            for idx, (
+                spec,
+                group_ids,
+                manager_cls,
+                use_eagle,
+                veto_exempt,
+            ) in enumerate(self.attention_groups):
                 first_group_id = group_ids[0]
                 # DCP/PCP shard each block's KV across ranks, so the manager's
                 # effective block size may exceed the spec's.
@@ -841,6 +899,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else 1
                     ),
                 )
+                if veto_exempt and _new_hit_length < curr_hit_length:
+                    # Not authoritative: leave unconfirmed for this round
+                    # rather than vetoing every other group's confirmed hit.
+                    continue
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -859,14 +921,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
-        first_group = self.attention_groups[0]
-        if isinstance(first_group.spec, FullAttentionSpec):
-            group_block_size = self.single_type_managers[
-                first_group.group_ids[0]
-            ].block_size
+        # Truncate every full-attention group (target and draft) blocks
+        # to final hit_length.
+        for group in self.attention_groups:
+            if not isinstance(group.spec, FullAttentionSpec):
+                continue
+            group_block_size = self.single_type_managers[group.group_ids[0]].block_size
             num_blocks = cdiv(hit_length, group_block_size)
-            for group_id in first_group.group_ids:
+            for group_id in group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
@@ -895,7 +957,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
-        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+        for (
+            spec,
+            group_ids,
+            manager_cls,
+            use_eagle,
+            _veto_exempt,
+        ) in self.attention_groups:
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,

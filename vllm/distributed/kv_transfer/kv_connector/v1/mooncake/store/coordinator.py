@@ -122,8 +122,17 @@ class MooncakeStoreCoordinator:
                 )
         # Full attention first (matches upstream convergence ordering).
         attention_groups.sort(key=lambda g: not isinstance(g.spec, FullAttentionSpec))
-        # Conservatively flag all groups when use_eagle is set but none is flagged.
-        if self.use_eagle and not any(g.use_eagle for g in attention_groups):
+        has_mixed_ephemeral_group = any(
+            g.contains_ephemeral_draft_layer for g in self.kv_cache_groups
+        )
+        # Conservatively flag all groups only when no explicit group-level
+        # metadata is available. Mixed target+ephemeral-draft groups retain
+        # ordinary target lookup semantics.
+        if (
+            self.use_eagle
+            and not any(g.use_eagle for g in attention_groups)
+            and not has_mixed_ephemeral_group
+        ):
             attention_groups = [g._replace(use_eagle=True) for g in attention_groups]
         self.attention_groups = attention_groups
         # Per-group eagle bits. SpecGroup carries use_eagle for the whole

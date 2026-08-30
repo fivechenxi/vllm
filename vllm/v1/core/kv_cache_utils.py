@@ -15,7 +15,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.hashing import sha256_cbor, xxhash_cbor
+from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
@@ -87,32 +87,73 @@ logger = init_logger(__name__)
 
 # The hash seed for the first block of any prefix block sequence.
 #
-# We use a random value to avoid hash collisions or PYTHONHASHSEED environment
-# variable if set such that processes can share the seed if needed. This aligns
-# with the behavior of Python's hash() function, which also uses a random seed
-# if PYTHONHASHSEED is not set.
+# For cryptographic hash algorithms it is derived deterministically from a fixed
+# default seed, so independent vLLM processes compute identical block hashes for
+# identical content and can share a prefix cache (e.g. KV cache reuse across
+# nodes) without extra configuration. This does not weaken collision resistance,
+# which for SHA-256 does not depend on keeping the seed secret; ``cache_salt``
+# remains the mechanism for intentional cache isolation.
+#
+# Non-cryptographic algorithms keep a per-process random seed, because a
+# predictable seed would let an attacker precompute colliding blocks offline
+# (see #12621). Setting PYTHONHASHSEED overrides the seed in both cases.
 #
 # The function `init_none_hash` initializes this variable globally.
 NONE_HASH: BlockHash
-_CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
+
+# Fixed seed used when the PYTHONHASHSEED environment variable is not set and
+# the hash algorithm is cryptographic.
+DEFAULT_NONE_HASH_SEED = "vllm-none-hash"
+
+# Algorithms that are not collision resistant, so the seed must stay secret.
+_NON_CRYPTO_HASH_FUNCTIONS = frozenset({xxhash, xxhash_cbor})
+
+# The seed NONE_HASH was derived from, set by init_none_hash.
+_NONE_HASH_SEED: str | None = None
+
+
+def resolve_none_hash_seed(hash_fn: Callable[[Any], bytes]) -> str:
+    """Resolve the seed to derive NONE_HASH from.
+
+    PYTHONHASHSEED wins if set. Otherwise cryptographic algorithms get the
+    fixed default (shareable across processes) and non-cryptographic ones get
+    fresh random bytes, keeping the seed unpredictable where collision
+    resistance depends on it.
+    """
+    hash_seed = os.getenv("PYTHONHASHSEED")
+    if hash_seed is not None:
+        return hash_seed
+    if hash_fn in _NON_CRYPTO_HASH_FUNCTIONS:
+        return os.urandom(32).hex()
+    return DEFAULT_NONE_HASH_SEED
+
+
+def get_none_hash_seed() -> str:
+    """Return the seed NONE_HASH was derived from.
+
+    Components that must agree on NONE_HASH across processes (the P2P tier
+    advertises this during its connect handshake) read the resolved seed here
+    instead of re-deriving it, so they observe the random seed too. Falls back
+    to the deterministic seed before ``init_none_hash`` has run.
+    """
+    if _NONE_HASH_SEED is None:
+        return DEFAULT_NONE_HASH_SEED
+    return _NONE_HASH_SEED
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
-    global NONE_HASH
+    global NONE_HASH, _NONE_HASH_SEED
 
-    hash_seed = os.getenv("PYTHONHASHSEED")
-    if hash_seed is None and hash_fn in _CBOR_HASH_FUNCTIONS:
+    _NONE_HASH_SEED = resolve_none_hash_seed(hash_fn)
+    if hash_fn in _NON_CRYPTO_HASH_FUNCTIONS and os.getenv("PYTHONHASHSEED") is None:
         logger.warning(
-            "PYTHONHASHSEED is not set. This will lead to non-reproducible "
-            "block-hashes when using CBOR-based hash functions such as "
-            "sha256_cbor or xxhash_cbor. Consider setting PYTHONHASHSEED to a "
-            "fixed value for reproducibility."
+            "Using a random per-process NONE_HASH seed because %s is not "
+            "collision resistant. Block hashes are therefore not reproducible "
+            "across processes; set PYTHONHASHSEED to a shared value to reuse "
+            "the prefix cache across instances, or use sha256.",
+            hash_fn.__name__,
         )
-
-    if hash_seed is None:
-        NONE_HASH = BlockHash(os.urandom(32))
-    else:
-        NONE_HASH = BlockHash(hash_fn(hash_seed))
+    NONE_HASH = BlockHash(hash_fn(_NONE_HASH_SEED))
 
 
 @dataclass(slots=True)
@@ -851,8 +892,17 @@ def check_enough_kv_cache_memory(
 
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
+        # Reserve the null block BlockPool permanently holds back, so the check
+        # plans against usable blocks, as in get_kv_cache_configs. Group a copy
+        # of the specs since grouping may unify them in-place.
+        groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
+        check_memory = (
+            available_memory - _pool_bytes_per_block(vllm_config, groups)
+            if groups
+            else available_memory
+        )
         _check_enough_kv_cache_memory(
-            available_memory,
+            check_memory,
             lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
             vllm_config.model_config.max_model_len,
             lambda am: estimate_max_model_len(vllm_config, kv_cache_spec, am),
@@ -1347,6 +1397,9 @@ def get_kv_cache_config_from_groups(
             num_blocks=1,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
         )
 
     # Determine how model runners should initialize the KV cache tensors.
@@ -1406,6 +1459,9 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
     )
 
 
@@ -1715,11 +1771,14 @@ def _annotate_eagle_groups_deepseek_v4(
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
         return
-    # Detection uses the merged MLA spec's model_version.
-    if not any(
+    # DeepSeek-V4 uses the merged MLA spec marker. Kimi-K3 reaches the
+    # general multi-group path because it also has KDA/Mamba groups, but its
+    # DSpark draft layers follow the same append-after-target ordering.
+    is_deepseek_v4 = any(
         getattr(spec, "model_version", None) == "deepseek_v4"
         for spec in kv_cache_spec.values()
-    ):
+    )
+    if not is_deepseek_v4 and not spec_config.use_dspark():
         return
     # DeepseekV4's MTP attention layer is always the last layer, and we flag whichever
     # group contains it.
@@ -1727,7 +1786,16 @@ def _annotate_eagle_groups_deepseek_v4(
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:
         if last_layer in group.layer_names:
-            group.is_eagle_group = True
+            ephemeral = spec_config.has_ephemeral_draft_context()
+            if ephemeral and len(group.layer_names) > 1:
+                # The group physically contains reusable target MLA and an
+                # ephemeral DSpark/DFlash layer. Cache it authoritatively as a
+                # target group; request-local draft prefix validity is handled
+                # by the speculator's restored-token mask.
+                group.contains_ephemeral_draft_layer = True
+            else:
+                group.is_eagle_group = True
+                group.eagle_group_is_veto_exempt = ephemeral
             break
 
 
@@ -1820,6 +1888,9 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    # Kimi-K3 + DSpark reaches this general hybrid grouping path (KDA/Mamba
+    # plus target MLA plus draft MLA), unlike DeepSeek-V4's uniform-group path.
+    _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
     return groups
 
 
@@ -2074,6 +2145,12 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                contains_ephemeral_draft_layer=(
+                    group.contains_ephemeral_draft_layer
+                    and bool(worker_layer_names)
+                ),
+                eagle_group_is_veto_exempt=group.eagle_group_is_veto_exempt
+                and bool(worker_layer_names),
             )
         )
     return projected_groups
@@ -2181,13 +2258,19 @@ def get_kv_cache_configs(
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
+    # Reserve the null block BlockPool permanently holds back, so auto-fit and
+    # the capacity check both plan against usable blocks. Allocation below
+    # still uses the full memory.
+    check_memory = [
+        avail_mem - _pool_bytes_per_block(vllm_config, groups) if groups else avail_mem
+        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+    ]
+
     if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
-        )
+        _auto_fit_max_model_len(vllm_config, projected_groups_per_worker, check_memory)
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
         if not groups:
             continue
         _check_enough_kv_cache_memory(

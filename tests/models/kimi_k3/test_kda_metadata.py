@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import fields
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -26,6 +27,9 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    RecoverSSMPostprocessMetadata,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     mamba_get_block_table_tensor,
@@ -44,8 +48,12 @@ PRUNED_METADATA_FIELDS = {
 }
 
 
-def _assert_matches_shared_gdn(reference, actual: KimiK3KDAMetadata):
-    for field in fields(KimiK3KDAMetadata):
+def _assert_matches_shared_gdn(
+    reference: GDNAttentionMetadata, actual: KimiK3KDAMetadata
+):
+    assert actual.recoverssm_commit is None
+    assert actual.recoverssm_context is None
+    for field in fields(GDNAttentionMetadata):
         actual_value = getattr(actual, field.name)
         expected_value = getattr(reference, field.name)
         if field.name in PRUNED_METADATA_FIELDS:
@@ -78,6 +86,7 @@ def _make_builder(
     full_cuda_graph: bool,
     device: torch.device = DEVICE,
     mamba_cache_mode: str = "none",
+    use_recoverssm: bool = False,
 ) -> AttentionMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -92,17 +101,24 @@ def _make_builder(
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
-    return builder_cls(
+    vllm_config.cache_config.use_replayssm = use_recoverssm
+    vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
+    builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=BLOCK_SIZE,
             shapes=((16, 64),),
             dtypes=(torch.float16,),
-            num_speculative_blocks=num_speculative_tokens,
+            mamba_cache_mode=mamba_cache_mode,
+            num_speculative_blocks=(0 if use_recoverssm else num_speculative_tokens),
         ),
         layer_names=["layer.0"],
         vllm_config=vllm_config,
         device=device,
     )
+    if use_recoverssm:
+        assert isinstance(builder, KimiK3KDAMetadataBuilder)
+        builder.recoverssm_context = Mock()
+    return builder
 
 
 @pytest.mark.parametrize(
@@ -244,6 +260,99 @@ def test_mixed_regular_and_spec_decode_excludes_request_padding():
     torch.testing.assert_close(actual.spec_token_indx, torch.tensor([1, 2, 3]))
 
 
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+def test_recoverssm_spec_uses_one_state_slot_and_current_window(
+    mamba_cache_mode: str,
+):
+    if mamba_cache_mode == "align" and not torch.cuda.is_available():
+        pytest.skip("align metadata construction requires CUDA")
+    device = torch.device("cuda") if mamba_cache_mode == "align" else DEVICE
+    batch = BatchSpec(seq_lens=[100, 65, 20], query_lens=[1, 1, 3])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device
+    ).replace(is_prefilling=torch.tensor([True, True, False]))
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=False,
+        device=device,
+        mamba_cache_mode=mamba_cache_mode,
+        use_recoverssm=True,
+    )
+    assert isinstance(builder, KimiK3KDAMetadataBuilder)
+    context = builder.recoverssm_context
+    assert context is not None
+    actual = builder.build(
+        0,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu=torch.tensor([-1, -1, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([3, 2, 2], dtype=torch.int32, device=device),
+    )
+
+    assert actual.spec_state_indices_tensor is not None
+    assert actual.spec_state_indices_tensor.shape == (1, 1)
+    torch.testing.assert_close(
+        actual.num_accepted_tokens,
+        torch.ones(1, dtype=torch.int32, device=device),
+    )
+    commit_metadata = actual.recoverssm_commit
+    assert commit_metadata is not None
+    torch.testing.assert_close(
+        commit_metadata.request_indices,
+        torch.tensor([2], dtype=torch.int32, device=device),
+    )
+    assert actual.recoverssm_context is context
+    num_accepted_tokens = torch.tensor([3, 2, 1], dtype=torch.int32, device=device)
+
+    postprocess = actual.commit_recoverssm_state(num_accepted_tokens)
+
+    if mamba_cache_mode == "none":
+        assert commit_metadata.align is None
+        assert postprocess is None
+    else:
+        assert isinstance(postprocess, RecoverSSMPostprocessMetadata)
+        assert postprocess.num_spec_decodes == 1
+        assert postprocess.request_indices is commit_metadata.request_indices
+        assert postprocess.block_table is common_attn_metadata.block_table_tensor
+        assert (
+            postprocess.num_computed_tokens
+            is common_attn_metadata.compute_num_computed_tokens()
+        )
+        assert postprocess.block_size == BLOCK_SIZE
+    args = context.commit.call_args.args
+    assert args[0] is num_accepted_tokens
+    torch.testing.assert_close(args[1], commit_metadata.state_indices[:, 0])
+    torch.testing.assert_close(args[2], commit_metadata.query_start_loc)
+
+
+def test_recoverssm_distinguishes_draftless_decode_from_one_token_prefill():
+    batch = BatchSpec(seq_lens=[40, 30], query_lens=[1, 1])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor([False, True]))
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=False,
+        use_recoverssm=True,
+    ).build(
+        0,
+        common_attn_metadata,
+        num_decode_draft_tokens_cpu=torch.full((2,), -1, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    assert actual.num_spec_decodes == 1
+    assert actual.num_decodes == 0
+    assert actual.num_prefills == 1
+    assert actual.spec_state_indices_tensor is not None
+    assert actual.spec_state_indices_tensor.shape == (1, 1)
+    torch.testing.assert_close(
+        actual.spec_query_start_loc,
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+
 @pytest.mark.parametrize(
     ("seq_len", "expected_has_initial_state"),
     [
@@ -305,6 +414,38 @@ def test_kimi_k3_kda_cudagraph_capture_matches_shared_gdn():
 
     assert isinstance(actual, KimiK3KDAMetadata)
     _assert_matches_shared_gdn(reference, actual)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_recoverssm_spec_cudagraph_stages_one_checkpoint_per_request():
+    device = torch.device("cuda")
+    batch = BatchSpec(seq_lens=[50, 30], query_lens=[3, 3])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device
+    ).replace(is_prefilling=torch.tensor([False, False]))
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=True,
+        device=device,
+        use_recoverssm=True,
+    )
+    assert isinstance(builder, KimiK3KDAMetadataBuilder)
+    assert builder.spec_state_indices_tensor.shape == (
+        builder.vllm_config.scheduler_config.max_num_seqs,
+        1,
+    )
+    actual = builder.build_for_cudagraph_capture(common_attn_metadata)
+
+    assert actual.spec_state_indices_tensor is not None
+    assert actual.spec_state_indices_tensor.shape == (batch.batch_size, 1)
+    assert actual.num_accepted_tokens is not None
+    torch.testing.assert_close(
+        actual.num_accepted_tokens,
+        torch.ones(batch.batch_size, dtype=torch.int32, device=device),
+    )
+    assert actual.recoverssm_commit is not None
+    assert actual.recoverssm_commit.request_indices is None
 
 
 def test_kimi_k3_kda_backend_uses_private_metadata_builder():
@@ -409,3 +550,198 @@ def test_aligned_block_table_matches_shared_gdn():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def _build_non_spec(batch, is_prefilling, full_cuda_graph=False):
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool))
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=full_cuda_graph,
+    )
+    return builder, common_attn_metadata, builder.build(0, common_attn_metadata)
+
+
+def test_one_token_first_chunk_excludes_padded_tokens():
+    """`num_prefill_tokens` must exclude cudagraph token padding.
+
+    It inherits `num_actual_tokens`, which a full cudagraph pads past the last
+    real token, so it has to be recomputed from the real query boundary."""
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 50, 1, 0], query_lens=[1, 1, 1, 0]),
+        BLOCK_SIZE,
+        DEVICE,
+    ).replace(
+        is_prefilling=torch.tensor([False, False, True, False], dtype=torch.bool),
+        num_actual_tokens=4,
+    )
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder, num_speculative_tokens=0, full_cuda_graph=False
+    )
+    actual = builder.build(0, common)
+
+    assert actual.num_decodes == 2
+    assert actual.num_prefills == 1
+    assert actual.num_decode_tokens == 2
+    assert actual.num_prefill_tokens == 1, "padded token counted as a prefill token"
+
+
+def test_one_token_first_chunk_excludes_trailing_padding():
+    """Trailing cudagraph padding must not be counted as prefill requests.
+
+    `split_decodes_and_prefills` counts the whole suffix after the first
+    prefill, so once a stateless first chunk promotes a row, zero-length
+    padding rows behind it would otherwise inflate `num_prefills`."""
+    # Two real rows (a resuming decode, then a stateless first chunk) followed
+    # by two zero-length cudagraph padding rows.
+    _, _, actual = _build_non_spec(
+        BatchSpec(seq_lens=[100, 1, 0, 0], query_lens=[1, 1, 0, 0]),
+        is_prefilling=[False, True, False, False],
+    )
+
+    assert actual.num_decodes == 1
+    assert actual.num_prefills == 1, "padding rows counted as prefills"
+    assert actual.num_prefill_tokens == 1
+    assert actual.num_decode_tokens == 1
+
+
+def test_one_token_first_chunk_is_not_a_decode():
+    """A request being forwarded for the first time owns no KDA state, so its
+    one-token chunk must be a prefill: only the prefill path masks the state
+    slot with has_initial_state, and mamba blocks are not zeroed on reuse."""
+    _, _, actual = _build_non_spec(
+        BatchSpec(seq_lens=[100, 50, 1], query_lens=[1, 1, 1]),
+        is_prefilling=[False, False, True],
+    )
+
+    assert actual.num_prefills == 1
+    assert actual.num_prefill_tokens == 1
+    assert actual.num_decodes == 2
+    assert actual.num_decode_tokens == 2
+    assert actual.has_initial_state is not None
+    assert actual.has_initial_state.tolist() == [True, True, False]
+
+
+def test_one_token_extend_chunk_stays_a_decode():
+    """A one-token chunk that resumes a partially prefilled request does own
+    valid state, so it must stay on the decode path."""
+    _, _, actual = _build_non_spec(
+        BatchSpec(seq_lens=[100, 50, 65], query_lens=[1, 1, 1]),
+        is_prefilling=[False, False, True],
+    )
+
+    assert actual.num_decodes == 3
+    assert actual.num_decode_tokens == 3
+    assert actual.num_prefills == 0
+    assert actual.num_prefill_tokens == 0
+    assert actual.has_initial_state is None
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "is_prefilling"),
+    [
+        pytest.param([100, 50, 1], [False, False, True], id="first-token-chunk"),
+        pytest.param([100, 50, 20], [False, False, False], id="pure-decode"),
+    ],
+)
+def test_one_token_batch_stages_cudagraph_state_indices(seq_lens, is_prefilling):
+    """Decode-graph dispatch is shape based, so a one-token batch stages its
+    state indices even when a stateless first chunk makes it a prefill batch."""
+    builder, common_attn_metadata, actual = _build_non_spec(
+        BatchSpec(seq_lens=seq_lens, query_lens=[1, 1, 1]),
+        is_prefilling=is_prefilling,
+        full_cuda_graph=True,
+    )
+
+    staged = actual.non_spec_state_indices_tensor
+    assert staged is not None
+    assert staged.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
+    torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
+
+
+def test_cudagraph_capture_batch_stays_decode_only():
+    """The dummy batch used for capture has seq_len == query_len for every row,
+    so classification must not promote it: the captured decode graph would
+    otherwise record the prefill kernels."""
+    batch = BatchSpec(seq_lens=[1] * 4, query_lens=[1] * 4)
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.zeros(4, dtype=torch.bool))
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=True,
+    )
+    actual = builder.build_for_cudagraph_capture(common_attn_metadata)
+
+    assert actual.num_prefills == 0
+    assert actual.num_decodes == 4
+    assert actual.has_initial_state is None
+
+
+def test_all_stateless_one_token_batch_stages_cudagraph_state_indices():
+    """A batch of nothing but first chunks has no decodes at all, and still has
+    to stage its state indices: decode-graph dispatch keys on shape."""
+    builder, common_attn_metadata, actual = _build_non_spec(
+        BatchSpec(seq_lens=[1, 1, 1], query_lens=[1, 1, 1]),
+        is_prefilling=[True, True, True],
+        full_cuda_graph=True,
+    )
+
+    assert actual.num_decodes == 0
+    assert actual.num_prefills == 3
+    staged = actual.non_spec_state_indices_tensor
+    assert staged is not None
+    assert staged.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
+    torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
+
+
+def test_zero_length_padding_row_is_not_a_prefill():
+    """A padded row carries no query tokens, so it must never be promoted out of
+    the decode group even if the runner still marks it as prefilling."""
+    _, _, actual = _build_non_spec(
+        BatchSpec(seq_lens=[100, 50, 0], query_lens=[1, 1, 0]),
+        is_prefilling=[False, False, True],
+    )
+
+    assert actual.num_decodes == 3
+    assert actual.num_prefills == 0
+    assert actual.has_initial_state is None
+
+
+def test_first_chunk_without_prefill_flag_is_left_unclassified():
+    """Without the runner's prefill flag (the microbatch path builds metadata
+    with is_prefilling unset), the builder cannot tell a first chunk from a
+    resumed one-token chunk, so it leaves the base classification unchanged
+    rather than promote a possibly-dummy batch."""
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 50, 1], query_lens=[1, 1, 1]), BLOCK_SIZE, DEVICE
+    )
+    assert common_attn_metadata.is_prefilling is None
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+    )
+    actual = builder.build(0, common_attn_metadata)
+
+    assert actual.num_prefills == 0
+    assert actual.has_initial_state is None
+
+
+def test_multi_token_batch_does_not_stage_cudagraph_state_indices():
+    """A batch with a longer-than-one-token row is not a decode-graph batch, so
+    the staging guard must not fire even though it now keys on query length."""
+    builder, common_attn_metadata, actual = _build_non_spec(
+        BatchSpec(seq_lens=[100, 50], query_lens=[1, 2]),
+        is_prefilling=[False, False],
+        full_cuda_graph=True,
+    )
+
+    assert actual.num_prefills == 1
+    assert (
+        actual.non_spec_state_indices_tensor.data_ptr()
+        != builder.non_spec_state_indices_tensor.data_ptr()
+    )

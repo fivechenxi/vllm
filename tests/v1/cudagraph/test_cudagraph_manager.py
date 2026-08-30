@@ -29,6 +29,47 @@ def _reset_graph_pool_id():
     pynccl_allocator._graph_pool_id = None
 
 
+def test_capture_dummy_receives_decode_query_len(monkeypatch: pytest.MonkeyPatch):
+    """Long capture dummy rows must be classified as prefills.
+
+    A 960-token PIECEWISE capture with 128 requests produces 7-8 tokens per
+    dummy row. Without forwarding the four-token speculative decode capacity,
+    RecoverSSM mistakes those rows for speculative decodes and startup fails.
+    """
+    received = {}
+
+    def fake_make_dummy(
+        cls,
+        num_reqs,
+        num_tokens,
+        input_buffers,
+        max_query_len=None,
+        decode_query_len=None,
+    ):
+        received["decode_query_len"] = decode_query_len
+        raise RuntimeError("dummy captured")
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.InputBatch,
+        "make_dummy",
+        classmethod(fake_make_dummy),
+    )
+    with pytest.raises(RuntimeError, match="dummy captured"):
+        gpu_cudagraph_utils.prepare_inputs_to_capture(
+            num_reqs=128,
+            num_tokens=960,
+            model_state=None,
+            input_buffers=None,
+            block_tables=None,
+            attn_groups=[],
+            kv_cache_config=None,
+            full_cudagraph=False,
+            decode_query_len=4,
+        )
+
+    assert received["decode_query_len"] == 4
+
+
 def _create_vllm_config() -> MagicMock:
     compilation_config = CompilationConfig(
         cudagraph_mode="FULL",
